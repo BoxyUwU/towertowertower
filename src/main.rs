@@ -170,7 +170,7 @@ fn move_camera(
         (
             &mut Transform,
             &mut UserState,
-            &ActionState<Action>,
+            &mut ActionState<Action>,
             &mut InputMap<Action>,
         ),
         With<Camera>,
@@ -189,7 +189,7 @@ fn move_camera(
     axes: Res<Axis<GamepadAxis>>,
     mut navmesh: ResMut<WipNavmesh>,
 ) {
-    let (mut transform, mut user_state, actions, mut map) = user.single_mut();
+    let (mut transform, mut user_state, mut actions, mut map) = user.single_mut();
     let pad = *pads.iter().next().unwrap();
     map.set_gamepad(pad);
 
@@ -239,58 +239,16 @@ fn move_camera(
                 },
             );
 
-        if let Some((e, pos, _)) = to_select {
+        if let Some((e, _, _)) = to_select {
             match &mut *user_state {
                 UserState::NoCorner => (),
                 UserState::GhostCorner {
-                    already_placed,
-                    ghost_corner: _,
-                } if already_placed.is_empty() => {
-                    let edge = new_edge(
-                        &mut cmds,
-                        Vec2::new(pos.translation.x, pos.translation.y),
-                        Vec2::new(transform.translation.x, transform.translation.y),
-                    );
-                    already_placed.push((e, edge));
-                }
-                UserState::GhostCorner {
-                    already_placed,
-                    ghost_corner: _,
-                } if already_placed.len() == 1 => {
-                    update_edge(&mut triangles, already_placed[0].1, already_placed[0].0, e);
-                    let end = Vec2::new(transform.translation.x, transform.translation.y);
-                    let start_trans = triangles.get_mut(already_placed[0].0).unwrap().1;
-                    already_placed[0].1 = new_edge(
-                        &mut cmds,
-                        Vec2::new(start_trans.translation.x, start_trans.translation.y),
-                        end,
-                    );
-
-                    let edge = new_edge(
-                        &mut cmds,
-                        Vec2::new(pos.translation.x, pos.translation.y),
-                        end,
-                    );
-                    already_placed.push((e, edge));
-                }
-                UserState::GhostCorner {
-                    already_placed,
-                    ghost_corner: _,
+                    already_placed: _,
+                    ghost_corner,
                 } => {
-                    update_edge(&mut triangles, already_placed[0].1, already_placed[0].0, e);
-                    update_edge(&mut triangles, already_placed[1].1, already_placed[1].0, e);
-
-                    new_triangle(
-                        &mut cmds,
-                        &mut triangles,
-                        already_placed[0].0,
-                        already_placed[1].0,
-                        e,
-                    );
-                    navmesh
-                        .0
-                        .push([already_placed[0].0, already_placed[1].0, e]);
-                    already_placed.clear();
+                    cmds.entity(*ghost_corner).despawn();
+                    *ghost_corner = e;
+                    actions.press(Action::PlaceCorner);
                 }
             }
         }
@@ -310,30 +268,38 @@ fn move_camera(
                 already_placed,
                 ghost_corner,
             } => {
-                *triangles.get_mut(*ghost_corner).unwrap().2 = normal_triangle_corner_draw_mode();
-                let trans = *transform.translation;
+                let (_, ghost_pos, mut draw_mode, ..) = triangles.get_mut(*ghost_corner).unwrap();
+                let ghost_pos = *ghost_pos;
+                *draw_mode = normal_triangle_corner_draw_mode();
+
                 already_placed.push((
                     *ghost_corner,
                     new_edge(
                         &mut cmds,
-                        Vec2::new(trans.x, trans.y),
-                        Vec2::new(trans.x, trans.y),
+                        Vec2::new(ghost_pos.translation.x, ghost_pos.translation.y),
+                        Vec2::new(ghost_pos.translation.x, ghost_pos.translation.y),
                     ),
                 ));
+                let old_ghost_corner_id = *ghost_corner;
                 *ghost_corner = new_ghost_corner_id;
 
-                if let [(a, _), (b, _), (c, _)] = already_placed[..] {
+                if let [(a, a_edge), (b, b_edge), (c, _)] = already_placed[..] {
+                    update_edge(&mut triangles, a_edge, a, c);
+                    update_edge(&mut triangles, b_edge, b, c);
+
                     new_triangle(&mut cmds, &mut triangles, a, b, c);
                     navmesh.0.push([a, b, c]);
                     already_placed.clear();
                 }
 
-                if let [(a_entity, edge_to_yeet), (_, _)] = &mut already_placed[..] {
-                    let start_trans = triangles.get_mut(*a_entity).unwrap().1;
+                if let [(a_entity, ref mut edge_to_yeet), (_, _)] = already_placed[..] {
+                    update_edge(&mut triangles, *edge_to_yeet, a_entity, old_ghost_corner_id);
+
+                    let start_trans = *triangles.get_mut(a_entity).unwrap().1;
                     *edge_to_yeet = new_edge(
                         &mut cmds,
                         Vec2::new(start_trans.translation.x, start_trans.translation.y),
-                        Vec2::new(trans.x, trans.y),
+                        Vec2::new(transform.translation.x, transform.translation.y),
                     );
                 }
             }
