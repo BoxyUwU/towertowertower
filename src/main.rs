@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_prototype_lyon::{plugin::ShapePlugin, prelude::*, shapes};
 use leafwing_input_manager::prelude::*;
+use std::{fmt::Debug, marker::PhantomData};
 
 fn main() {
     App::new()
@@ -52,14 +53,28 @@ enum Action {
 #[derive(Component)]
 struct User;
 
-#[derive(Component)]
+struct KindedEntity<T>(Entity, PhantomData<T>);
+impl<T> KindedEntity<T> {
+    fn new(e: Entity) -> Self {
+        Self(e, PhantomData)
+    }
+}
+impl<T> Copy for KindedEntity<T> {}
+impl<T> Clone for KindedEntity<T> {
+    fn clone(&self) -> Self {
+        Self(self.0, PhantomData)
+    }
+}
+impl<T> Debug for KindedEntity<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Component)]
 enum UserState {
     NoCorner,
-    GhostCorner {
-        /// Vec<{ triangle_entity: Entity, edge_entity_to_ghost_corner: Entity }>
-        already_placed: Vec<(Entity, Entity)>,
-        ghost_corner: Entity,
-    },
+    GhostCorner(Vec<(KindedEntity<Corner>, KindedEntity<Edge>)>),
 }
 
 struct UserEntityId(Entity);
@@ -85,10 +100,21 @@ fn spawn_user(mut cmds: Commands<'_, '_>) {
     cmds.insert_resource(UserEntityId(id));
 }
 
-struct WipNavmesh(Vec<[Entity; 3]>);
+#[allow(dead_code)]
+struct Triangle {
+    corners: [KindedEntity<Corner>; 3],
+    edges: [KindedEntity<Edge>; 3],
+    face: KindedEntity<Face>,
+}
+
+struct WipNavmesh(Vec<Triangle>);
 
 #[derive(Component)]
 struct Corner;
+#[derive(Component)]
+struct Edge;
+#[derive(Component)]
+struct Face;
 
 fn new_ghost_corner(cmds: &mut Commands<'_, '_>, transform: Transform) -> Entity {
     cmds.spawn_bundle(GeometryBuilder::build_as(
@@ -102,9 +128,9 @@ fn new_ghost_corner(cmds: &mut Commands<'_, '_>, transform: Transform) -> Entity
 
 fn new_edge(cmds: &mut Commands<'_, '_>, start: Vec2, end: Vec2) -> Entity {
     cmds.spawn_bundle(GeometryBuilder::build_as(
-        &shapes::Line(Vec2::new(0.0, 0.0), end - start),
+        &shapes::Line(start, end),
         edge_draw_mode(),
-        Transform::from_translation(Vec3::new(start.x, start.y, 0.0)),
+        Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
     ))
     .id()
 }
@@ -120,16 +146,16 @@ fn update_edge(
         ),
         Without<Camera>,
     >,
-    edge: Entity,
-    start_tri: Entity,
-    end_tri: Entity,
+    edge: KindedEntity<Edge>,
+    start_tri: KindedEntity<Corner>,
+    end_tri: KindedEntity<Corner>,
 ) {
-    let start_trans = triangles.get_mut(start_tri).unwrap().1;
+    let start_trans = triangles.get_mut(start_tri.0).unwrap().1;
     let start = Vec2::new(start_trans.translation.x, start_trans.translation.y);
-    let end_transform = triangles.get_mut(end_tri).unwrap().1;
+    let end_transform = triangles.get_mut(end_tri.0).unwrap().1;
     let end = Vec2::new(end_transform.translation.x, end_transform.translation.y);
-    let (_, _, _, mut path, _) = triangles.get_mut(edge).unwrap();
-    *path = ShapePath::build_as(&shapes::Line(Vec2::new(0.0, 0.0), end - start));
+    let (_, _, _, mut path, _) = triangles.get_mut(edge.0).unwrap();
+    *path = ShapePath::build_as(&shapes::Line(start, end));
 }
 
 fn new_triangle(
@@ -144,24 +170,27 @@ fn new_triangle(
         ),
         Without<Camera>,
     >,
-    e1: Entity,
-    e2: Entity,
-    e3: Entity,
-) {
-    let [(_, p1, ..), (_, p2, ..), (_, p3, ..)] = triangles.many_mut([e1, e2, e3]);
+    e1: KindedEntity<Corner>,
+    e2: KindedEntity<Corner>,
+    e3: KindedEntity<Corner>,
+) -> KindedEntity<Face> {
+    let [(_, p1, ..), (_, p2, ..), (_, p3, ..)] = triangles.many_mut([e1.0, e2.0, e3.0]);
 
-    cmds.spawn_bundle(GeometryBuilder::build_as(
-        &shapes::Polygon {
-            points: vec![
-                Vec2::new(p1.translation.x, p1.translation.y),
-                Vec2::new(p2.translation.x, p2.translation.y),
-                Vec2::new(p3.translation.x, p3.translation.y),
-            ],
-            closed: true,
-        },
-        DrawMode::Fill(FillMode::color(Color::rgba(0.0, 1.0, 1.0, 0.5))),
-        Transform::default(),
-    ));
+    KindedEntity::new(
+        cmds.spawn_bundle(GeometryBuilder::build_as(
+            &shapes::Polygon {
+                points: vec![
+                    Vec2::new(p1.translation.x, p1.translation.y),
+                    Vec2::new(p2.translation.x, p2.translation.y),
+                    Vec2::new(p3.translation.x, p3.translation.y),
+                ],
+                closed: true,
+            },
+            DrawMode::Fill(FillMode::color(Color::rgba(0.0, 1.0, 1.0, 0.5))),
+            Transform::default(),
+        ))
+        .id(),
+    )
 }
 
 fn move_camera(
@@ -201,15 +230,9 @@ fn move_camera(
         .unwrap();
     transform.translation += Vec3::new(x, y, 0.0) * 25.0;
 
-    if let UserState::GhostCorner {
-        already_placed,
-        ghost_corner,
-    } = &mut *user_state
-    {
-        triangles.get_mut(*ghost_corner).unwrap().1.translation = transform.translation;
-        for (start_entity, edge_entity) in already_placed {
-            update_edge(&mut triangles, *edge_entity, *start_entity, *ghost_corner);
-        }
+    if let UserState::GhostCorner(corners) = &*user_state {
+        let (corner, _) = *corners.last().unwrap();
+        triangles.get_mut(corner.0).unwrap().1.translation = transform.translation;
     }
 
     if actions.just_pressed(Action::SelectCorner) {
@@ -242,66 +265,53 @@ fn move_camera(
         if let Some((e, _, _)) = to_select {
             match &mut *user_state {
                 UserState::NoCorner => (),
-                UserState::GhostCorner {
-                    already_placed: _,
-                    ghost_corner,
-                } => {
-                    cmds.entity(*ghost_corner).despawn();
-                    *ghost_corner = e;
+                UserState::GhostCorner(corners) => {
+                    let (ghost_corner, _) = corners.last_mut().unwrap();
+                    cmds.entity(ghost_corner.0).despawn();
+                    *ghost_corner = KindedEntity::new(e);
                     actions.press(Action::PlaceCorner);
                 }
             }
         }
     }
 
-    if actions.just_pressed(Action::PlaceCorner) {
-        let new_ghost_corner_id = new_ghost_corner(&mut cmds, *transform);
+    if let UserState::GhostCorner(corners) = &*user_state {
+        for (start_idx, end_idx) in [(0, 1), (1, 2), (2, 0)] {
+            if let (Some((start_corner, edge_entity)), Some((end_corner, _))) =
+                (corners.get(start_idx), corners.get(end_idx))
+            {
+                update_edge(&mut triangles, *edge_entity, *start_corner, *end_corner);
+            }
+        }
+    }
 
+    if actions.just_pressed(Action::PlaceCorner) {
         match &mut *user_state {
             UserState::NoCorner => {
-                *user_state = UserState::GhostCorner {
-                    already_placed: vec![],
-                    ghost_corner: new_ghost_corner_id,
-                };
+                let pos = Vec2::new(transform.translation.x, transform.translation.y);
+                *user_state = UserState::GhostCorner(vec![(
+                    KindedEntity::new(new_ghost_corner(&mut cmds, *transform)),
+                    KindedEntity::new(new_edge(&mut cmds, pos, pos)),
+                )]);
             }
-            UserState::GhostCorner {
-                already_placed,
-                ghost_corner,
-            } => {
-                let (_, ghost_pos, mut draw_mode, ..) = triangles.get_mut(*ghost_corner).unwrap();
-                let ghost_pos = *ghost_pos;
-                *draw_mode = normal_triangle_corner_draw_mode();
-
-                already_placed.push((
-                    *ghost_corner,
-                    new_edge(
-                        &mut cmds,
-                        Vec2::new(ghost_pos.translation.x, ghost_pos.translation.y),
-                        Vec2::new(ghost_pos.translation.x, ghost_pos.translation.y),
-                    ),
-                ));
-                let old_ghost_corner_id = *ghost_corner;
-                *ghost_corner = new_ghost_corner_id;
-
-                if let [(a, a_edge), (b, b_edge), (c, _)] = already_placed[..] {
-                    update_edge(&mut triangles, a_edge, a, c);
-                    update_edge(&mut triangles, b_edge, b, c);
-
-                    new_triangle(&mut cmds, &mut triangles, a, b, c);
-                    navmesh.0.push([a, b, c]);
-                    already_placed.clear();
+            UserState::GhostCorner(corners) => {
+                if let [(a_corner, a_edge), (b_corner, b_edge), (c_corner, c_edge)] = corners[..] {
+                    let face =
+                        new_triangle(&mut cmds, &mut triangles, a_corner, b_corner, c_corner);
+                    navmesh.0.push(Triangle {
+                        corners: [a_corner, b_corner, c_corner],
+                        edges: [a_edge, b_edge, c_edge],
+                        face,
+                    });
+                    corners.clear();
                 }
 
-                if let [(a_entity, ref mut edge_to_yeet), (_, _)] = already_placed[..] {
-                    update_edge(&mut triangles, *edge_to_yeet, a_entity, old_ghost_corner_id);
-
-                    let start_trans = *triangles.get_mut(a_entity).unwrap().1;
-                    *edge_to_yeet = new_edge(
-                        &mut cmds,
-                        Vec2::new(start_trans.translation.x, start_trans.translation.y),
-                        Vec2::new(transform.translation.x, transform.translation.y),
-                    );
-                }
+                let pos = Vec2::new(transform.translation.x, transform.translation.y);
+                let new_corner = (
+                    KindedEntity::new(new_ghost_corner(&mut cmds, *transform)),
+                    KindedEntity::new(new_edge(&mut cmds, pos, pos)),
+                );
+                corners.push(new_corner);
             }
         }
     }
