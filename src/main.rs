@@ -1,3 +1,5 @@
+#![feature(array_zip)]
+
 use bevy::prelude::*;
 use bevy_prototype_lyon::{plugin::ShapePlugin, prelude::*, shapes};
 use leafwing_input_manager::prelude::*;
@@ -8,7 +10,11 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugin(ShapePlugin)
         .add_plugin(InputManagerPlugin::<Action>::default())
-        .insert_resource(WipNavmesh(vec![]))
+        .insert_resource(WipNavmesh {
+            corners: vec![],
+            edges: vec![],
+            faces: vec![],
+        })
         .add_startup_system(spawn_user)
         .add_system(move_camera)
         .run()
@@ -100,14 +106,188 @@ fn spawn_user(mut cmds: Commands<'_, '_>) {
     cmds.insert_resource(UserEntityId(id));
 }
 
-#[allow(dead_code)]
-struct Triangle {
-    corners: [KindedEntity<Corner>; 3],
-    edges: [KindedEntity<Edge>; 3],
-    face: KindedEntity<Face>,
+struct WipNavmesh {
+    faces: Vec<(
+        KindedEntity<Face>,
+        [(KindedEntity<Edge>, usize); 3],
+        [(KindedEntity<Corner>, usize); 3],
+    )>,
+
+    edges: Vec<(
+        KindedEntity<Edge>,
+        // 1..=2 elements
+        Vec<(KindedEntity<Face>, usize)>,
+        [(KindedEntity<Corner>, usize); 2],
+    )>,
+
+    corners: Vec<(
+        KindedEntity<Corner>,
+        Vec<(KindedEntity<Edge>, usize)>,
+        Vec<(KindedEntity<Face>, usize)>,
+    )>,
 }
 
-struct WipNavmesh(Vec<Triangle>);
+impl WipNavmesh {
+    fn new_triangle(
+        &mut self,
+        // dear god bevy just get query joins already -_-
+        mut get_transform: impl FnMut(KindedEntity<Corner>) -> Transform,
+        corners: [KindedEntity<Corner>; 3],
+        edges: [KindedEntity<Edge>; 3],
+        face: KindedEntity<Face>,
+    ) {
+        let mut get_transform = |entity| {
+            let trans = get_transform(entity).translation;
+            Vec2::new(trans.x, trans.y)
+        };
+        let corner_positions = corners.map(|corner| get_transform(corner));
+        let a_to_b = corner_positions[1] - corner_positions[0];
+        let a_to_c = corner_positions[2] - corner_positions[0];
+        let wound_correctly = a_to_b
+            .extend(0.0)
+            .cross(a_to_c.extend(0.0))
+            .z // FIXME zero(?)
+            .is_sign_positive();
+
+        let (corners, edges) = match wound_correctly {
+            true => (corners, edges),
+            false => (
+                [corners[0], corners[2], corners[1]],
+                [edges[0], edges[2], edges[1]],
+            ),
+        };
+
+        enum Index {
+            Present(usize),
+            ToBeInserted(usize),
+        }
+        impl Index {
+            fn inner(&self) -> usize {
+                match self {
+                    Self::Present(n) | Self::ToBeInserted(n) => *n,
+                }
+            }
+        }
+
+        let mut a = 0;
+        let corner_indices = corners.map(|corner| {
+            self.corners
+                .iter()
+                .enumerate()
+                .flat_map(
+                    |(n, (corner_entity, _, _))| match corner.0 == corner_entity.0 {
+                        true => Some(Index::Present(n)),
+                        false => None,
+                    },
+                )
+                .next()
+                .unwrap_or_else(|| {
+                    a += 1;
+                    Index::ToBeInserted(self.corners.len() + a - 1)
+                })
+        });
+        let corners = [0, 1, 2].map(|idx| match corner_indices[idx] {
+            Index::Present(n) => self.corners[n].0,
+            _ => corners[idx],
+        });
+
+        let mut a = 0;
+        let edge_indices = [(0, 1), (1, 2), (2, 0)].map(|(c1, c2)| {
+            let (c1, c2) = (corner_indices[c1].inner(), corner_indices[c2].inner());
+            self.edges
+                .iter()
+                .enumerate()
+                .flat_map(|(n, &(_, _, [(_, other_c1), (_, other_c2)]))| {
+                    match [c1, c2] == [other_c1, other_c2] || [c2, c1] == [other_c1, other_c2] {
+                        true => Some(Index::Present(n)),
+                        false => None,
+                    }
+                })
+                .next()
+                .unwrap_or_else(|| {
+                    a += 1;
+                    Index::ToBeInserted(self.edges.len() + a - 1)
+                })
+        });
+        let edges = [0, 1, 2].map(|idx| match edge_indices[idx] {
+            Index::Present(n) => self.edges[n].0,
+            _ => edges[idx],
+        });
+
+        let face_index = self
+            .faces
+            .iter()
+            .enumerate()
+            .find_map(
+                |(n, &(_, _, [(_, other_c1), (_, other_c2), (_, other_c3)]))| {
+                    let (c1, c2, c3) = (
+                        corner_indices[0].inner(),
+                        corner_indices[1].inner(),
+                        corner_indices[2].inner(),
+                    );
+                    let other_corners = [other_c1, other_c2, other_c3];
+                    let same_face = [c1, c2, c3] == other_corners
+                        || [c3, c1, c2] == other_corners
+                        || [c2, c3, c1] == other_corners;
+                    match same_face {
+                        true => Some(Index::Present(n)),
+                        false => None,
+                    }
+                },
+            )
+            .unwrap_or_else(|| Index::ToBeInserted(self.faces.len()));
+        if let Index::Present(_) = face_index {
+            return;
+        }
+
+        for (n, corner) in corner_indices.iter().enumerate() {
+            if let Index::ToBeInserted(_) = corner {
+                self.corners.push((corners[n], vec![], vec![]));
+            };
+
+            let idx = corner.inner();
+            let corner = &mut self.corners[idx];
+            corner.2.push((face, face_index.inner()));
+            let n_plus_1 = match n {
+                2 => 0,
+                _ => n + 1,
+            };
+            for edge_idx in [n, n_plus_1] {
+                if let Index::ToBeInserted(_) = edge_indices[edge_idx] {
+                    corner
+                        .1
+                        .push((edges[edge_idx], edge_indices[edge_idx].inner()));
+                }
+            }
+        }
+
+        for (n, edge) in edge_indices.iter().enumerate() {
+            if let Index::ToBeInserted(_) = edge {
+                let n_plus_1 = match n {
+                    2 => 0,
+                    _ => n + 1,
+                };
+
+                self.edges.push((
+                    edges[n],
+                    vec![],
+                    [
+                        (corners[n], corner_indices[n].inner()),
+                        (corners[n_plus_1], corner_indices[n_plus_1].inner()),
+                    ],
+                ))
+            }
+
+            self.edges[edge.inner()].1.push((face, face_index.inner()));
+        }
+
+        self.faces.push((
+            face,
+            edges.zip(edge_indices.map(|idx| idx.inner())),
+            corners.zip(corner_indices.map(|idx| idx.inner())),
+        ));
+    }
+}
 
 #[derive(Component)]
 struct Corner;
@@ -266,6 +446,7 @@ fn move_camera(
             match &mut *user_state {
                 UserState::NoCorner => (),
                 UserState::GhostCorner(corners) => {
+                    // FIXME i think we end up creating unnecessary edges here.
                     let (ghost_corner, _) = corners.last_mut().unwrap();
                     cmds.entity(ghost_corner.0).despawn();
                     *ghost_corner = KindedEntity::new(e);
@@ -295,14 +476,16 @@ fn move_camera(
                 )]);
             }
             UserState::GhostCorner(corners) => {
+                assert!(matches!(corners.len(), 1..=3));
                 if let [(a_corner, a_edge), (b_corner, b_edge), (c_corner, c_edge)] = corners[..] {
                     let face =
                         new_triangle(&mut cmds, &mut triangles, a_corner, b_corner, c_corner);
-                    navmesh.0.push(Triangle {
-                        corners: [a_corner, b_corner, c_corner],
-                        edges: [a_edge, b_edge, c_edge],
+                    navmesh.new_triangle(
+                        |entity| *triangles.get_component::<Transform>(entity.0).unwrap(),
+                        [a_corner, b_corner, c_corner],
+                        [a_edge, b_edge, c_edge],
                         face,
-                    });
+                    );
                     corners.clear();
                 }
 
